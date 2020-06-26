@@ -1,0 +1,13 @@
+#
+# Copyright (c) 2020 Antonio Alvarado Hernández
+#
+
+[package]
+name = "ruk"
+version = "0.1.0"
+authors = ["Antonio Alvarado Hernández <tnotstar@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
