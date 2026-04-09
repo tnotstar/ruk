@@ -1,15 +1,29 @@
-#
-# Copyright (c) 2020 Antonio Alvarado Hernández
-#
+# Copyright 2020 - 2026, Antonio Alvarado <tnotstar+copyright@gmail.com>
+# -*- coding: utf-8 -*-
 
 [package]
 name = "ruk"
 version = "0.1.0"
+edition = "2021"
 authors = ["Antonio Alvarado Hernández <tnotstar@gmail.com>"]
-edition = "2018"
+description = "A high-performance HTTP benchmarking tool written in Rust"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = "0.13"
-tokio = { version = "0.2", features = ["full"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+flume = "0.11"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
