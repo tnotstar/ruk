@@ -1,4 +1,4 @@
-# Copyright 2020 - 2026, Antonio Alvarado <tnotstar+copyright@gmail.com>
+# Copyright 2020-2026, Antonio Alvarado <tnotstar+copyright@gmail.com>
 # -*- coding: utf-8 -*-
 
 [package]
@@ -11,15 +11,12 @@ description = "A high-performance HTTP benchmarking tool written in Rust"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = { version = "1.0", features = ["full"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
-hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-tokio"] }
-http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 flume = "0.11"
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 mimalloc = { version = "0.1", default-features = false }
+httparse = "1"
 
 [profile.release]
 opt-level = 3

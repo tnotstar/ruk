@@ -1,0 +1,13 @@
+# Forzar LF para todos los archivos de texto
+* text=auto eol=lf
+
+# Definiciones específicas para código y documentación
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Archivos binarios
+*.png binary
+*.jpg binary
+*.gif binary

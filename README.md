@@ -1,4 +1,4 @@
-<!-- Copyright (c) 2020 Antonio Alvarado Hernández -->
+<!-- Copyright 2020-2026, Antonio Alvarado <tnotstar+copyright@gmail.com> -->
 
 The `ruk` Project
 =================
