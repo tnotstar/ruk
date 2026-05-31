@@ -5,20 +5,20 @@
  */
 
 use clap::Parser;
-use flume::Receiver;
 use hdrhistogram::Histogram;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{Duration, Instant};
+use std::time::{Duration, Instant};
+use mio::net::TcpStream;
+use mio::{Events, Interest, Poll, Token};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const RECVBUF: usize = 16384;
-const MAX_HEADERS: usize = 64;
+const MAX_HEADERS: usize = 16; // Optimized from 64 to 16 to save stack initialization time
 const STATUS_SLOTS: usize = 600;
 
 #[derive(Parser, Debug)]
@@ -70,27 +70,11 @@ impl WorkerStats {
         self.total_requests += other.total_requests;
         self.successful_requests += other.successful_requests;
         self.total_bytes += other.total_bytes;
-        self.latency_hist.add(other.latency_hist).expect("Histogram merge failed");
+        let _ = self.latency_hist.add(other.latency_hist);
         for i in 0..STATUS_SLOTS {
             self.status_codes[i] += other.status_codes[i];
         }
     }
-}
-
-async fn aggregator_task(rx: Receiver<WorkerStats>) -> WorkerStats {
-    let mut total_stats = WorkerStats::default();
-    while let Ok(worker_stats) = rx.recv_async().await {
-        total_stats.merge(worker_stats);
-    }
-    total_stats
-}
-
-fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs: Vec<SocketAddr> = format!("{}:{}", host, port).to_socket_addrs()?.collect();
-    if let Some(v4) = addrs.iter().find(|a| a.is_ipv4()) {
-        return Ok(*v4);
-    }
-    addrs.into_iter().next().ok_or_else(|| "DNS resolution failed".into())
 }
 
 struct UrlParts {
@@ -127,6 +111,14 @@ fn parse_url(url: &str) -> Result<UrlParts, Box<dyn std::error::Error + Send + S
     })
 }
 
+fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let addrs: Vec<SocketAddr> = format!("{}:{}", host, port).to_socket_addrs()?.collect();
+    if let Some(v4) = addrs.iter().find(|a| a.is_ipv4()) {
+        return Ok(*v4);
+    }
+    addrs.into_iter().next().ok_or_else(|| "DNS resolution failed".into())
+}
+
 fn build_request(path: &str, authority: &str) -> Vec<u8> {
     format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -141,26 +133,77 @@ enum BodyInfo {
     UntilClose,
 }
 
-fn classify_body(headers: &[httparse::Header]) -> BodyInfo {
+struct HeaderInfo {
+    body_info: BodyInfo,
+    connection_close: bool,
+}
+
+fn parse_usize(bytes: &[u8]) -> Option<usize> {
+    let mut val = 0;
+    let mut has_digits = false;
+    for &b in bytes {
+        if b >= b'0' && b <= b'9' {
+            val = val * 10 + (b - b'0') as usize;
+            has_digits = true;
+        } else if b == b' ' || b == b'\t' {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if has_digits { Some(val) } else { None }
+}
+
+fn bytes_contains_chunked(bytes: &[u8]) -> bool {
+    bytes.windows(7).any(|w| {
+        w[0].to_ascii_lowercase() == b'c'
+            && w[1].to_ascii_lowercase() == b'h'
+            && w[2].to_ascii_lowercase() == b'u'
+            && w[3].to_ascii_lowercase() == b'n'
+            && w[4].to_ascii_lowercase() == b'k'
+            && w[5].to_ascii_lowercase() == b'e'
+            && w[6].to_ascii_lowercase() == b'd'
+    })
+}
+
+fn bytes_eq_close(bytes: &[u8]) -> bool {
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+        start += 1;
+    }
+    let mut end = bytes.len();
+    while end > start && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\t' || bytes[end - 1] == b'\r' || bytes[end - 1] == b'\n') {
+        end -= 1;
+    }
+    let len = end - start;
+    if len != 5 {
+        return false;
+    }
+    let slice = &bytes[start..end];
+    slice[0].to_ascii_lowercase() == b'c'
+        && slice[1].to_ascii_lowercase() == b'l'
+        && slice[2].to_ascii_lowercase() == b'o'
+        && slice[3].to_ascii_lowercase() == b's'
+        && slice[4].to_ascii_lowercase() == b'e'
+}
+
+fn classify_headers(headers: &[httparse::Header]) -> HeaderInfo {
     let mut content_length = None;
     let mut chunked = false;
     let mut connection_close = false;
 
     for h in headers {
-        if h.name.eq_ignore_ascii_case("content-length") {
-            content_length = std::str::from_utf8(h.value).ok().and_then(|v| v.parse().ok());
-        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = std::str::from_utf8(h.value)
-                .map(|v| v.contains("chunked"))
-                .unwrap_or(false);
-        } else if h.name.eq_ignore_ascii_case("connection") {
-            connection_close = std::str::from_utf8(h.value)
-                .map(|v| v.eq_ignore_ascii_case("close"))
-                .unwrap_or(false);
+        let name = h.name;
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = parse_usize(h.value);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = bytes_contains_chunked(h.value);
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_close = bytes_eq_close(h.value);
         }
     }
 
-    if let Some(cl) = content_length {
+    let body_info = if let Some(cl) = content_length {
         BodyInfo::ContentLength(cl)
     } else if chunked {
         BodyInfo::Chunked
@@ -168,347 +211,636 @@ fn classify_body(headers: &[httparse::Header]) -> BodyInfo {
         BodyInfo::UntilClose
     } else {
         BodyInfo::UntilClose
+    };
+
+    HeaderInfo {
+        body_info,
+        connection_close,
     }
 }
 
-async fn discard_bytes(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-    mut remaining: usize,
-) -> Result<usize, ()> {
-    let mut total = 0;
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len());
-        let n = stream.read(&mut buf[..to_read]).await.map_err(|_| ())?;
-        if n == 0 {
-            return Err(());
-        }
-        remaining -= n;
-        total += n;
-    }
-    Ok(total)
+#[derive(Clone, Copy)]
+enum ConnState {
+    Connecting,
+    Reconnecting,
+    Writing,
+    ReadingHeaders,
+    ReadingBody {
+        remaining: usize,
+    },
+    ReadingChunked {
+        chunk_state: ChunkState,
+        parsed_offset: usize,
+    },
+    ReadingUntilClose,
 }
 
-async fn discard_chunked(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-    initial: &[u8],
-) -> Result<usize, ()> {
-    let mut extra = 0;
-    let mut pending: Vec<u8> = initial.to_vec();
-    let mut pos = 0;
+#[derive(Clone, Copy)]
+enum ChunkState {
+    Size,
+    Data { remaining: usize },
+    DataCRLF,
+    Trailer,
+}
 
-    loop {
-        while pos < pending.len() && pending[pos] == b'\r' {
-            pos += 1;
+struct Connection {
+    token: Token,
+    socket: TcpStream,
+    state: ConnState,
+    start_time: Option<Instant>,
+    buf: Vec<u8>,
+    read_len: usize,
+    written_len: usize,
+    close_connection: bool,
+    addr: SocketAddr,
+}
+
+fn connect_socket(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    let socket = TcpStream::connect(addr)?;
+    socket.set_nodelay(true)?;
+    Ok(socket)
+}
+
+fn reconnect_conn(
+    conn: &mut Connection,
+    poll: &Poll,
+    _stats: &mut WorkerStats,
+    _recording: &AtomicBool,
+) {
+    let _ = poll.registry().deregister(&mut conn.socket);
+
+    match connect_socket(conn.addr) {
+        Ok(mut socket) => {
+            if let Ok(()) = poll.registry().register(
+                &mut socket,
+                conn.token,
+                Interest::WRITABLE,
+            ) {
+                conn.socket = socket;
+                conn.state = ConnState::Connecting;
+            } else {
+                conn.state = ConnState::Reconnecting;
+            }
         }
-        if pos < pending.len() && pending[pos] == b'\n' {
-            pos += 1;
+        Err(_) => {
+            conn.state = ConnState::Reconnecting;
         }
+    }
+
+    conn.read_len = 0;
+    conn.written_len = 0;
+    conn.close_connection = false;
+    conn.start_time = None;
+}
+
+fn complete_request(
+    conn: &mut Connection,
+    poll: &Poll,
+    stats: &mut WorkerStats,
+    recording: &AtomicBool,
+) {
+    let is_rec = recording.load(Ordering::Relaxed);
+    if is_rec {
+        if let Some(start) = conn.start_time {
+            let elapsed = start.elapsed().as_micros() as u64;
+            let _ = stats.latency_hist.record(elapsed);
+        }
+    }
+
+    if conn.close_connection {
+        reconnect_conn(conn, poll, stats, recording);
+    } else {
+        conn.read_len = 0;
+        conn.written_len = 0;
+        conn.start_time = Some(Instant::now());
+        conn.state = ConnState::Writing;
+        let _ = poll.registry().reregister(
+            &mut conn.socket,
+            conn.token,
+            Interest::WRITABLE,
+        );
+    }
+}
+
+fn parse_chunked_body(
+    conn: &mut Connection,
+    poll: &Poll,
+    stats: &mut WorkerStats,
+    recording: &AtomicBool,
+) -> bool {
+    if let ConnState::ReadingChunked { ref mut chunk_state, ref mut parsed_offset } = conn.state {
+        let mut offset = *parsed_offset;
+        let mut state = *chunk_state;
 
         loop {
-            if pos + 1 >= pending.len() {
-                let n = stream.read(buf).await.map_err(|_| ())?;
-                if n == 0 {
-                    return Err(());
-                }
-                pending.extend_from_slice(&buf[..n]);
-                extra += n;
-                continue;
-            }
+            match state {
+                ChunkState::Size => {
+                    let slice = &conn.buf[offset..conn.read_len];
+                    if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        let size_str = match std::str::from_utf8(&slice[..pos]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                reconnect_conn(conn, poll, stats, recording);
+                                return true;
+                            }
+                        };
+                        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
+                        let chunk_size = match usize::from_str_radix(size_str, 16) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                reconnect_conn(conn, poll, stats, recording);
+                                return true;
+                            }
+                        };
 
-            let line_end = pending[pos..].windows(2).position(|w| w == b"\r\n");
-            if let Some(i) = line_end {
-                let size_str = std::str::from_utf8(&pending[pos..pos + i]).map_err(|_| ())?;
-                let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
-                let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| ())?;
-                pos += i + 2;
+                        offset += pos + 2;
 
-                if chunk_size == 0 {
-                    return Ok(extra);
-                }
-
-                let needed = chunk_size + 2;
-                while pos + needed > pending.len() {
-                    let n = stream.read(buf).await.map_err(|_| ())?;
-                    if n == 0 {
-                        return Err(());
+                        if chunk_size == 0 {
+                            state = ChunkState::Trailer;
+                        } else {
+                            state = ChunkState::Data { remaining: chunk_size };
+                        }
+                    } else {
+                        break;
                     }
-                    pending.extend_from_slice(&buf[..n]);
-                    extra += n;
                 }
-                pos += needed;
+                ChunkState::Data { remaining } => {
+                    let available = conn.read_len - offset;
+                    if available >= remaining {
+                        offset += remaining;
+                        state = ChunkState::DataCRLF;
+                    } else {
+                        offset += available;
+                        state = ChunkState::Data { remaining: remaining - available };
+                        break;
+                    }
+                }
+                ChunkState::DataCRLF => {
+                    let available = conn.read_len - offset;
+                    if available >= 2 {
+                        if &conn.buf[offset..offset + 2] == b"\r\n" {
+                            offset += 2;
+                            state = ChunkState::Size;
+                        } else {
+                            reconnect_conn(conn, poll, stats, recording);
+                            return true;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                ChunkState::Trailer => {
+                    let slice = &conn.buf[offset..conn.read_len];
+                    if slice.starts_with(b"\r\n") {
+                        offset += 2;
+                        *chunk_state = state;
+                        *parsed_offset = offset;
+                        complete_request(conn, poll, stats, recording);
+                        return true;
+                    } else if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        offset += pos + 2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        *chunk_state = state;
+        *parsed_offset = offset;
+
+        if offset > 0 {
+            if offset >= conn.buf.len() - 1024 || offset > 8192 {
+                let unparsed = conn.read_len - offset;
+                conn.buf.copy_within(offset..conn.read_len, 0);
+                conn.read_len = unparsed;
+                *parsed_offset = 0;
+            }
+        }
+    }
+    false
+}
+
+fn handle_read(
+    conn: &mut Connection,
+    _request: &[u8],
+    recording: &AtomicBool,
+    stats: &mut WorkerStats,
+    poll: &Poll,
+) {
+    loop {
+        if conn.read_len >= conn.buf.len() {
+            reconnect_conn(conn, poll, stats, recording);
+            return;
+        }
+
+        match conn.socket.read(&mut conn.buf[conn.read_len..]) {
+            Ok(0) => {
+                match conn.state {
+                    ConnState::ReadingUntilClose => {
+                        complete_request(conn, poll, stats, recording);
+                    }
+                    _ => {
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_requests += 1;
+                            stats.status_codes[0] += 1;
+                        }
+                        reconnect_conn(conn, poll, stats, recording);
+                    }
+                }
+                return;
+            }
+            Ok(n) => {
+                conn.read_len += n;
+                match conn.state {
+                    ConnState::ReadingHeaders => {
+                        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+                        let mut resp = httparse::Response::new(&mut headers);
+                        match resp.parse(&conn.buf[..conn.read_len]) {
+                            Ok(httparse::Status::Complete(header_len)) => {
+                                let status = resp.code.unwrap_or(0);
+                                let is_rec = recording.load(Ordering::Relaxed);
+                                if is_rec {
+                                    stats.total_requests += 1;
+                                    if status >= 200 && status < 400 {
+                                        stats.successful_requests += 1;
+                                    }
+                                    let idx = status as usize;
+                                    if idx < STATUS_SLOTS {
+                                        stats.status_codes[idx] += 1;
+                                    }
+                                    stats.total_bytes += conn.read_len as u64;
+                                }
+
+                                let info = classify_headers(&headers);
+                                conn.close_connection = info.connection_close;
+
+                                let body_in_buffer = conn.read_len - header_len;
+
+                                match info.body_info {
+                                    BodyInfo::ContentLength(cl) => {
+                                        if body_in_buffer >= cl {
+                                            complete_request(conn, poll, stats, recording);
+                                            return;
+                                        } else {
+                                            conn.state = ConnState::ReadingBody {
+                                                remaining: cl - body_in_buffer,
+                                            };
+                                            conn.read_len = 0;
+                                        }
+                                    }
+                                    BodyInfo::Chunked => {
+                                        conn.state = ConnState::ReadingChunked {
+                                            chunk_state: ChunkState::Size,
+                                            parsed_offset: header_len,
+                                        };
+                                        if parse_chunked_body(conn, poll, stats, recording) {
+                                            return;
+                                        }
+                                    }
+                                    BodyInfo::UntilClose => {
+                                        conn.state = ConnState::ReadingUntilClose;
+                                        conn.read_len = 0;
+                                    }
+                                }
+                            }
+                            Ok(httparse::Status::Partial) => {
+                                break;
+                            }
+                            Err(_) => {
+                                reconnect_conn(conn, poll, stats, recording);
+                                return;
+                            }
+                        }
+                    }
+                    ConnState::ReadingBody { remaining } => {
+                        let bytes_read = n;
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_bytes += bytes_read as u64;
+                        }
+
+                        if bytes_read >= remaining {
+                            complete_request(conn, poll, stats, recording);
+                            return;
+                        } else {
+                            conn.state = ConnState::ReadingBody { remaining: remaining - bytes_read };
+                            conn.read_len = 0;
+                        }
+                    }
+                    ConnState::ReadingChunked { .. } => {
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_bytes += n as u64;
+                        }
+                        if parse_chunked_body(conn, poll, stats, recording) {
+                            return;
+                        }
+                        break;
+                    }
+                    ConnState::ReadingUntilClose => {
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_bytes += n as u64;
+                        }
+                        conn.read_len = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 break;
-            } else if pending.len() - pos > 16 {
-                return Err(());
-            } else {
-                let n = stream.read(buf).await.map_err(|_| ())?;
-                if n == 0 {
-                    return Err(());
-                }
-                pending.extend_from_slice(&buf[..n]);
-                extra += n;
+            }
+            Err(_) => {
+                reconnect_conn(conn, poll, stats, recording);
+                return;
             }
         }
     }
 }
 
-enum ExecuteError {
-    ConnectionClosed,
-    ProtocolError,
-}
-
-struct ResponseResult {
-    status: u16,
-    total_bytes: usize,
-    connection_close: bool,
-}
-
-async fn execute_request(
-    stream: &mut TcpStream,
+fn handle_write(
+    conn: &mut Connection,
     request: &[u8],
-    buf: &mut [u8],
-) -> Result<ResponseResult, ExecuteError> {
-    stream.write_all(request).await.map_err(|_| ExecuteError::ConnectionClosed)?;
-
-    let mut total_read = 0;
-
-    let (status, header_len, body_info) = loop {
-        if total_read >= buf.len() {
-            return Err(ExecuteError::ProtocolError);
-        }
-
-        let n = stream.read(&mut buf[total_read..]).await.map_err(|_| ExecuteError::ConnectionClosed)?;
-        if n == 0 {
-            return Err(ExecuteError::ConnectionClosed);
-        }
-        total_read += n;
-
-        let parsed = {
-            let mut hdr = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut resp = httparse::Response::new(&mut hdr);
-            match resp.parse(&buf[..total_read]) {
-                Ok(httparse::Status::Complete(hlen)) => {
-                    Some((resp.code.ok_or(ExecuteError::ProtocolError)?, hlen, classify_body(resp.headers)))
+    recording: &AtomicBool,
+    stats: &mut WorkerStats,
+    poll: &Poll,
+) {
+    loop {
+        match conn.state {
+            ConnState::Connecting => {
+                match conn.socket.take_error() {
+                    Ok(None) => {
+                        conn.state = ConnState::Writing;
+                        conn.start_time = Some(Instant::now());
+                        conn.written_len = 0;
+                    }
+                    _ => {
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_requests += 1;
+                            stats.status_codes[0] += 1;
+                        }
+                        reconnect_conn(conn, poll, stats, recording);
+                        return;
+                    }
                 }
-                Ok(httparse::Status::Partial) => None,
-                Err(_) => return Err(ExecuteError::ProtocolError),
             }
-        };
+            ConnState::Writing => {
+                let to_write = &request[conn.written_len..];
+                match conn.socket.write(to_write) {
+                    Ok(n) => {
+                        conn.written_len += n;
+                        if conn.written_len >= request.len() {
+                            conn.state = ConnState::ReadingHeaders;
+                            conn.read_len = 0;
+                            let _ = poll.registry().reregister(
+                                &mut conn.socket,
+                                conn.token,
+                                Interest::READABLE,
+                            );
+                            return;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return;
+                    }
+                    Err(_) => {
+                        let is_rec = recording.load(Ordering::Relaxed);
+                        if is_rec {
+                            stats.total_requests += 1;
+                            stats.status_codes[0] += 1;
+                        }
+                        reconnect_conn(conn, poll, stats, recording);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let _ = poll.registry().reregister(
+                    &mut conn.socket,
+                    conn.token,
+                    Interest::READABLE,
+                );
+                return;
+            }
+        }
+    }
+}
 
-        if let Some((s, h, b)) = parsed {
-            break (s, h, b);
+fn worker_thread(
+    thread_id: usize,
+    num_conns: usize,
+    addr: SocketAddr,
+    request: Vec<u8>,
+    running: Arc<AtomicBool>,
+    recording: Arc<AtomicBool>,
+) -> WorkerStats {
+    let mut stats = WorkerStats::default();
+    if num_conns == 0 {
+        return stats;
+    }
+
+    let mut poll = match Poll::new() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("Thread {} failed to create Poll instance", thread_id);
+            return stats;
         }
     };
 
-    let body_in_buffer = total_read - header_len;
-    let mut total_bytes = total_read;
+    let mut events = Events::with_capacity(1024);
+    let mut connections = Vec::with_capacity(num_conns);
 
-    match body_info {
-        BodyInfo::ContentLength(cl) => {
-            let remaining = cl.saturating_sub(body_in_buffer);
-            total_bytes += discard_bytes(stream, buf, remaining).await.map_err(|_| ExecuteError::ConnectionClosed)?;
-        }
-        BodyInfo::Chunked => {
-            let initial_data = buf[header_len..total_read].to_vec();
-            total_bytes += discard_chunked(stream, buf, &initial_data).await.map_err(|_| ExecuteError::ConnectionClosed)?;
-        }
-        BodyInfo::UntilClose => {
-            loop {
-                let n = stream.read(buf).await.map_err(|_| ExecuteError::ConnectionClosed)?;
-                if n == 0 {
-                    break;
+    for i in 0..num_conns {
+        let token = Token(i);
+        let mut retry_count = 0;
+        let socket = loop {
+            match connect_socket(addr) {
+                Ok(s) => break s,
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count > 5 {
+                        eprintln!(
+                            "Thread {} connection {} failed to connect after 5 attempts: {}",
+                            thread_id, i, e
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                total_bytes += n;
             }
-            return Ok(ResponseResult {
-                status,
-                total_bytes,
-                connection_close: true,
-            });
+        };
+
+        let mut socket = socket;
+        let _ = poll.registry().register(
+            &mut socket,
+            token,
+            Interest::WRITABLE,
+        );
+
+        connections.push(Connection {
+            token,
+            socket,
+            state: ConnState::Connecting,
+            start_time: None,
+            buf: vec![0u8; RECVBUF],
+            read_len: 0,
+            written_len: 0,
+            close_connection: false,
+            addr,
+        });
+    }
+
+    while running.load(Ordering::Relaxed) {
+        for conn in &mut connections {
+            if let ConnState::Reconnecting = conn.state {
+                if let Ok(mut socket) = connect_socket(addr) {
+                    if let Ok(()) = poll.registry().register(
+                        &mut socket,
+                        conn.token,
+                        Interest::WRITABLE,
+                    ) {
+                        conn.socket = socket;
+                        conn.state = ConnState::Connecting;
+                    }
+                }
+            }
+        }
+
+        match poll.poll(&mut events, Some(Duration::from_millis(100))) {
+            Ok(_) => {
+                for event in events.iter() {
+                    let token = event.token();
+                    let conn_idx = token.0;
+                    if conn_idx < connections.len() {
+                        let mut conn = &mut connections[conn_idx];
+
+                        if event.is_writable() {
+                            handle_write(&mut conn, &request, &recording, &mut stats, &poll);
+                        }
+                        if event.is_readable() {
+                            handle_read(&mut conn, &request, &recording, &mut stats, &poll);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    eprintln!("Thread {} poll error: {}", thread_id, e);
+                }
+            }
         }
     }
 
-    Ok(ResponseResult {
-        status,
-        total_bytes,
-        connection_close: false,
-    })
-}
+    for conn in &mut connections {
+        let _ = poll.registry().deregister(&mut conn.socket);
+    }
 
-async fn connect(addr: SocketAddr) -> Result<TcpStream, ()> {
-    let stream = TcpStream::connect(addr).await.map_err(|_| ())?;
-    stream.set_nodelay(true).map_err(|_| ())?;
-    Ok(stream)
+    stats
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if args.threads > 0 {
-        builder.worker_threads(args.threads);
-    }
-    builder.enable_all();
-
-    let rt = builder.build()?;
-    rt.block_on(async_main(args))
-}
-
-async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = parse_url(&args.url)?;
     let addr = resolve_addr(&url.host, url.port)?;
     eprintln!("Resolved {} -> {}", url.host, addr);
 
     let request = build_request(&url.path, &url.authority);
 
-    let (tx, rx) = flume::unbounded();
     let recording = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(true));
 
-    let aggregator_handle = tokio::spawn(aggregator_task(rx));
+    let num_threads = if args.threads > 0 {
+        args.threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
 
-    let mut worker_handles = Vec::with_capacity(args.connections);
+    let conns_per_thread = args.connections / num_threads;
+    let extra_conns = args.connections % num_threads;
 
-    for worker_id in 0..args.connections {
-        let tx = tx.clone();
+    let mut thread_handles = Vec::with_capacity(num_threads);
+
+    for thread_id in 0..num_threads {
         let recording = recording.clone();
         let running = running.clone();
         let request = request.clone();
+        let num_conns = conns_per_thread + if thread_id < extra_conns { 1 } else { 0 };
 
-        worker_handles.push(tokio::spawn(async move {
-            let mut stats = WorkerStats::default();
-            let mut buf = [0u8; RECVBUF];
-
-            let mut stream = match connect(addr).await {
-                Ok(s) => s,
-                Err(()) => {
-                    eprintln!("Worker {} failed to connect", worker_id);
-                    let _ = tx.send_async(stats).await;
-                    return;
-                }
-            };
-
-            while running.load(Ordering::Relaxed) {
-                let mut is_retry = false;
-                loop {
-                    let start = Instant::now();
-                    let is_rec = recording.load(Ordering::Relaxed);
-
-                    match execute_request(&mut stream, &request, &mut buf).await {
-                        Ok(result) => {
-                            if is_rec {
-                                stats.total_requests += 1;
-                                if result.status >= 200 && result.status < 400 {
-                                    stats.successful_requests += 1;
-                                }
-                                stats.total_bytes += result.total_bytes as u64;
-                                let idx = result.status as usize;
-                                if idx < STATUS_SLOTS {
-                                    stats.status_codes[idx] += 1;
-                                }
-                                let elapsed = start.elapsed().as_micros() as u64;
-                                let _ = stats.latency_hist.record(elapsed);
-                            }
-
-                            if result.connection_close {
-                                if let Ok(s) = connect(addr).await {
-                                    stream = s;
-                                }
-                            }
-                            break;
-                        }
-                        Err(ExecuteError::ConnectionClosed) if !is_retry => {
-                            // Silent reconnect and retry once
-                            if let Ok(s) = connect(addr).await {
-                                stream = s;
-                                is_retry = true;
-                                continue;
-                            } else {
-                                if is_rec {
-                                    stats.total_requests += 1;
-                                    stats.status_codes[0] += 1;
-                                }
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            if is_rec {
-                                stats.total_requests += 1;
-                                stats.status_codes[0] += 1;
-                                let elapsed = start.elapsed().as_micros() as u64;
-                                let _ = stats.latency_hist.record(elapsed);
-                            }
-
-                            // Try to reconnect for the next iteration
-                            if let Ok(s) = connect(addr).await {
-                                stream = s;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let _ = tx.send_async(stats).await;
+        thread_handles.push(std::thread::spawn(move || {
+            worker_thread(thread_id, num_conns, addr, request, running, recording)
         }));
     }
 
+    let running_ctrlc = running.clone();
+    ctrlc::set_handler(move || {
+        running_ctrlc.store(false, Ordering::Relaxed);
+    })
+    .expect("Error setting Ctrl-C handler");
+
     // Phase 1: Warmup
     println!("Warming up for {} seconds...", args.warmup);
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(args.warmup)) => {}
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nInterrupted during warmup.");
-            running.store(false, Ordering::Relaxed);
+    let warmup_start = Instant::now();
+    let warmup_duration = Duration::from_secs(args.warmup);
+    while Instant::now().duration_since(warmup_start) < warmup_duration {
+        if !running.load(Ordering::Relaxed) {
+            println!("Interrupted during warmup.");
             return Ok(());
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     // Phase 2: Execution
     println!("Running benchmark for {} seconds...", args.duration);
     recording.store(true, Ordering::Relaxed);
-
     let exec_start = Instant::now();
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(args.duration)) => {}
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nInterrupted during benchmark.");
+    let exec_duration = Duration::from_secs(args.duration);
+    while Instant::now().duration_since(exec_start) < exec_duration {
+        if !running.load(Ordering::Relaxed) {
+            println!("Interrupted during benchmark.");
+            break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     running.store(false, Ordering::Relaxed);
+    recording.store(false, Ordering::Relaxed);
+
     let actual_duration = exec_start.elapsed();
 
-    for handle in worker_handles {
-        let _ = handle.await;
+    let mut total_stats = WorkerStats::default();
+    for handle in thread_handles {
+        if let Ok(stats) = handle.join() {
+            total_stats.merge(stats);
+        }
     }
-
-    drop(tx);
-    let stats = aggregator_handle.await.unwrap();
 
     // Summary
     println!("\n=== Benchmark Summary ===");
     println!("Target URL:          {}", args.url);
     println!("Concurrency Level:   {}", args.connections);
     println!("Time Taken:          {:.2}s", actual_duration.as_secs_f64());
-    println!("Total Requests:      {}", stats.total_requests);
-    println!("Successful Reqs:     {}", stats.successful_requests);
+    println!("Total Requests:      {}", total_stats.total_requests);
+    println!("Successful Reqs:     {}", total_stats.successful_requests);
     println!(
         "Failed Requests:     {}",
-        stats.total_requests - stats.successful_requests
+        total_stats.total_requests - total_stats.successful_requests
     );
     println!(
         "Data Transferred:    {:.2} MB",
-        stats.total_bytes as f64 / 1_048_576.0
+        total_stats.total_bytes as f64 / 1_048_576.0
     );
     println!(
         "Requests/sec:        {:.2}",
-        stats.total_requests as f64 / actual_duration.as_secs_f64()
+        total_stats.total_requests as f64 / actual_duration.as_secs_f64()
     );
 
     println!("\nStatus Codes:");
-    for (code, &count) in stats.status_codes.iter().enumerate() {
+    for (code, &count) in total_stats.status_codes.iter().enumerate() {
         if count > 0 {
             if code == 0 {
                 println!("  [Network Error]:     {}", count);
@@ -518,8 +850,8 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error + Send +
         }
     }
 
-    if stats.total_requests > 0 {
-        let hist = stats.latency_hist;
+    if total_stats.total_requests > 0 {
+        let hist = total_stats.latency_hist;
         println!("\nLatency Distribution:");
         println!("  Min:         {:.2} ms", hist.min() as f64 / 1000.0);
         println!("  Mean:        {:.2} ms", hist.mean() / 1000.0);
